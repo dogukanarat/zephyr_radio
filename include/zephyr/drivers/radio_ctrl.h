@@ -46,22 +46,22 @@ struct radio_ctrl_msg_stats {
     int16_t signal_rssi; // [dBm]
 };
 
-typedef int (*radio_ctrl_api_set_config_gfsk)(struct device *dev,
+typedef int (*radio_ctrl_api_set_config_gfsk)(const struct device *dev,
                                               const ralf_params_gfsk_t *rx_params,
                                               const ralf_params_gfsk_t *tx_params);
 
-typedef int (*radio_ctrl_api_set_config_lora)(struct device *dev,
+typedef int (*radio_ctrl_api_set_config_lora)(const struct device *dev,
                                               const ralf_params_lora_t *rx_params,
                                               const ralf_params_lora_t *tx_params,
                                               const ralf_params_lora_cad_t *cad_params);
 
-typedef int (*radio_ctrl_api_set_config_flrc)(struct device *dev,
+typedef int (*radio_ctrl_api_set_config_flrc)(const struct device *dev,
                                               const ralf_params_flrc_t *rx_params,
                                               const ralf_params_flrc_t *tx_params);
 
-typedef int (*radio_ctrl_api_set_config_lr_fhss)(struct device *dev,
-                                             const ralf_params_lr_fhss_t *rx_params,
-                                             const ralf_params_lr_fhss_t *tx_params);
+typedef int (*radio_ctrl_api_set_config_lr_fhss)(const struct device *dev,
+                                                 const ralf_params_lr_fhss_t *rx_params,
+                                                 const ralf_params_lr_fhss_t *tx_params);
 
 typedef int (*radio_ctrl_api_set_antenna_switch)(const struct device *dev, bool tx_enable);
 
@@ -209,10 +209,10 @@ static inline int radio_ctrl_transmit(const struct device *dev, const uint8_t *d
 }
 
 static inline int radio_ctrl_receive(const struct device *dev, uint8_t *data, size_t size,
-                                     struct msg_stats *statistics, uint32_t timeout)
+                                     struct radio_ctrl_msg_stats *stats, uint32_t timeout)
 {
     const struct radio_ctrl_driver_api *api = (const struct radio_ctrl_driver_api *)dev->api;
-    return api->receive(dev, data, size, statistics, timeout);
+    return api->receive(dev, data, size, stats, timeout);
 }
 
 static inline int radio_ctrl_flush_rx_queue(const struct device *dev)
