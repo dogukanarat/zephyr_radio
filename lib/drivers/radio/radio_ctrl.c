@@ -5,6 +5,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/drivers/radio_ctrl.h>
 #include "zephyr/drivers/sx126x/sx126x_hal.h"
 #include "zephyr/drivers/ralf/ralf_sx126x.h"
@@ -24,6 +25,27 @@ LOG_MODULE_REGISTER(radio_ctrl, CONFIG_RADIO_CTRL_LOG_LEVEL);
 
 /* Maximum SPI transfer size for stack-allocated buffers */
 #define RADIO_CTRL_HAL_MAX_TRANSFER_SIZE   256
+
+/* All events mask for clearing stale events */
+#define RADIO_CTRL_EVENT_ALL_MASK          (RADIO_CTRL_EVENT_TX_DONE | \
+                                            RADIO_CTRL_EVENT_RX_DONE | \
+                                            RADIO_CTRL_EVENT_RX_TIMEOUT | \
+                                            RADIO_CTRL_EVENT_RX_HDR_ERROR | \
+                                            RADIO_CTRL_EVENT_RX_CRC_ERROR | \
+                                            RADIO_CTRL_EVENT_CAD_DONE | \
+                                            RADIO_CTRL_EVENT_CAD_OK)
+
+/* Internal atomic IRQ stats for thread-safe access from ISR context */
+struct radio_ctrl_irq_stats_atomic {
+    atomic_t rx_done;
+    atomic_t tx_done;
+    atomic_t timeout;
+    atomic_t hdr_error;
+    atomic_t crc_error;
+    atomic_t cad_done;
+    atomic_t cad_ok;
+    atomic_t none;
+};
 
 struct radio_ctrl_msg {
     uint16_t size;
@@ -50,6 +72,7 @@ struct radio_ctrl_data {
     ralf_params_lora_t tx_params;
     ralf_params_lora_cad_t cad_params;
     struct radio_ctrl_stats stats;
+    struct radio_ctrl_irq_stats_atomic irq_stats_atomic;  /* Thread-safe IRQ stats */
     sx126x_hal_context_t sx126x_hal_ctx;
     struct k_event event;
     struct radio_ctrl_msg msg_buffer[CONFIG_RADIO_CTRL_RX_MSGQ_MAX_MSGS];
@@ -493,109 +516,130 @@ static int radio_ctrl_impl_transmit(const struct device *dev, const uint8_t *dat
     struct radio_ctrl_data *ctrl_data = dev->data;
     int ret = 0;
     ral_status_t ral_status;
-    uint32_t timeout;
-    bool switch_to_standby = false;
+    uint32_t tx_timeout;
+    bool tx_started = false;
     ralf_params_lora_t lora_params = {0};
+
+    if (data == NULL) {
+        return -EINVAL;
+    }
+
+    if (size > CONFIG_RADIO_CTRL_MAX_MSG_SIZE) {
+        LOG_ERR("Data size exceeds maximum limit: %d > %d", size, CONFIG_RADIO_CTRL_MAX_MSG_SIZE);
+        return -EINVAL;
+    }
 
     k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
 
-    do {
-        if (size > CONFIG_RADIO_CTRL_MAX_MSG_SIZE) {
-            ret = -EINVAL;
-            LOG_ERR("Data size exceeds maximum limit: %d > %d", size, CONFIG_RADIO_CTRL_MAX_MSG_SIZE);
-            break;
-        }
+    ctrl_data->stats.tx_attempts++;
 
-        ctrl_data->stats.tx_attempts++;
+    if (!ctrl_data->is_ralf_initialized) {
+        ret = -ENODEV;
+        LOG_ERR("Radio is not initialized");
+        goto unlock_and_return;
+    }
 
-        if (!ctrl_data->is_ralf_initialized) {
-            ret = -ENODEV;
-            LOG_ERR("Radio is not initialized");
-            break;
-        }
+    if (!ctrl_data->is_configured) {
+        ret = -EACCES;
+        LOG_ERR("Radio is not configured");
+        goto unlock_and_return;
+    }
 
-        if (!ctrl_data->is_configured) {
-            ret = -EACCES;
-            LOG_ERR("Radio is not configured");
-            break;
-        }
+    /* Clear any stale TX_DONE events from previous operations */
+    k_event_clear(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE);
 
-        timeout = ral_get_lora_time_on_air_in_ms(ral_from_ralf(&ctrl_data->radio),
-                                                 &ctrl_data->tx_params.pkt_params,
-                                                 &ctrl_data->tx_params.mod_params);
-        timeout += 100; /* Add 100 ms for processing delay */
+    tx_timeout = ral_get_lora_time_on_air_in_ms(ral_from_ralf(&ctrl_data->radio),
+                                                &ctrl_data->tx_params.pkt_params,
+                                                &ctrl_data->tx_params.mod_params);
+    tx_timeout += 100; /* Add 100 ms for processing delay */
 
-        memcpy(&lora_params, &ctrl_data->tx_params, sizeof(ralf_params_lora_t));
-        lora_params.pkt_params.pld_len_in_bytes = size;
+    memcpy(&lora_params, &ctrl_data->tx_params, sizeof(ralf_params_lora_t));
+    lora_params.pkt_params.pld_len_in_bytes = size;
 
-        /* Set the radio to standby */
-        ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
-        if (RAL_STATUS_OK != ral_status) {
-            ret = -EIO;
-            LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
-            break;
-        }
+    /* Set the radio to standby */
+    ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
+    if (RAL_STATUS_OK != ral_status) {
+        ret = -EIO;
+        LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
+        goto unlock_and_return;
+    }
 
-        /* Set the LoRa modem parameters */
-        ral_status = ralf_setup_lora(&ctrl_data->radio, &lora_params);
-        if (RAL_STATUS_OK != ral_status) {
-            ret = -EIO;
-            LOG_ERR("Failed to setup the LoRa modem! Status: %08X", ral_status);
-            break;
-        }
+    /* Set the LoRa modem parameters */
+    ral_status = ralf_setup_lora(&ctrl_data->radio, &lora_params);
+    if (RAL_STATUS_OK != ral_status) {
+        ret = -EIO;
+        LOG_ERR("Failed to setup the LoRa modem! Status: %08X", ral_status);
+        goto unlock_and_return;
+    }
 
-        /* Set the DIO IRQ parameters */
-        ral_status = ral_set_dio_irq_params(ral_from_ralf(&ctrl_data->radio), RAL_IRQ_TX_DONE);
-        if (RAL_STATUS_OK != ral_status) {
-            ret = -EIO;
-            LOG_ERR("Failed to set the DIO IRQ parameters! Status: %08X", ral_status);
-            break;
-        }
+    /* Set the DIO IRQ parameters */
+    ral_status = ral_set_dio_irq_params(ral_from_ralf(&ctrl_data->radio), RAL_IRQ_TX_DONE);
+    if (RAL_STATUS_OK != ral_status) {
+        ret = -EIO;
+        LOG_ERR("Failed to set the DIO IRQ parameters! Status: %08X", ral_status);
+        goto unlock_and_return;
+    }
 
-        /* Set the packet payload */
-        ral_status = ral_set_pkt_payload(ral_from_ralf(&ctrl_data->radio), data, size);
-        if (RAL_STATUS_OK != ral_status) {
-            ret = -EIO;
-            LOG_ERR("Failed to set the packet payload! Status: %08X", ral_status);
-            break;
-        }
+    /* Set the packet payload */
+    ral_status = ral_set_pkt_payload(ral_from_ralf(&ctrl_data->radio), data, size);
+    if (RAL_STATUS_OK != ral_status) {
+        ret = -EIO;
+        LOG_ERR("Failed to set the packet payload! Status: %08X", ral_status);
+        goto unlock_and_return;
+    }
 
-        switch_to_standby = true;
-        /* Set the radio to transmit */
-        ral_status = ral_set_tx(ral_from_ralf(&ctrl_data->radio));
-        if (RAL_STATUS_OK != ral_status) {
-            ret = -EIO;
-            LOG_ERR("Failed to set the radio to transmit! Status: %08X", ral_status);
-            break;
-        }
+    /* Set the radio to transmit */
+    ral_status = ral_set_tx(ral_from_ralf(&ctrl_data->radio));
+    if (RAL_STATUS_OK != ral_status) {
+        ret = -EIO;
+        LOG_ERR("Failed to set the radio to transmit! Status: %08X", ral_status);
+        goto unlock_and_return;
+    }
 
-        LOG_DBG("Transmitting... data size: %d, timeout: %d ms", size, timeout);
+    tx_started = true;
+    LOG_DBG("Transmitting... data size: %d, timeout: %d ms", size, tx_timeout);
 
-        uint32_t events = k_event_wait(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE, true,
-                                        K_MSEC(timeout));
-        if ((events & RADIO_CTRL_EVENT_TX_DONE) == 0) {
-            ret = -ETIMEDOUT;
-            ctrl_data->stats.tx_timeout++;
-            LOG_ERR("Transmit timeout");
-            break;
-        }
+    /*
+     * Release mutex before waiting for TX completion.
+     * This allows the IRQ work handler to acquire the mutex and process
+     * the TX_DONE interrupt. Without this, we would deadlock.
+     */
+    k_mutex_unlock(&ctrl_data->mutex);
 
+    /* Wait for TX completion event - mutex not held */
+    uint32_t events = k_event_wait(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE, true,
+                                   K_MSEC(tx_timeout));
+
+    /* Re-acquire mutex for cleanup and stats update */
+    k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
+
+    if ((events & RADIO_CTRL_EVENT_TX_DONE) == 0) {
+        ret = -ETIMEDOUT;
+        ctrl_data->stats.tx_timeout++;
+        LOG_ERR("Transmit timeout");
+    } else {
         ret = 0;
         ctrl_data->stats.tx_success++;
         LOG_DBG("Transmit done!");
+    }
 
-    } while (0);
-
-    if (switch_to_standby) {
-        ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
-        if (RAL_STATUS_OK != ral_status) {
+    /* Return radio to standby after TX completes or times out */
+    ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
+    if (RAL_STATUS_OK != ral_status) {
+        LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
+        if (ret == 0) {
             ret = -EIO;
-            LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
         }
     }
 
-    k_mutex_unlock(&ctrl_data->mutex);
+unlock_and_return:
+    /* Handle case where TX setup failed before starting */
+    if (!tx_started && ret != 0) {
+        /* Try to put radio in known state */
+        ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
+    }
 
+    k_mutex_unlock(&ctrl_data->mutex);
     return ret;
 }
 
@@ -606,25 +650,30 @@ static int radio_ctrl_impl_receive(const struct device *dev, uint8_t *data, size
     int ret = 0;
     struct radio_ctrl_msg msg = {0};
 
-    do {
-        if (!data) {
-            ret = -EINVAL;
-            break;
-        }
+    if (data == NULL) {
+        return -EINVAL;
+    }
 
-        if (k_msgq_get(&ctrl_data->rx_msgq, &msg, K_MSEC(timeout)) == 0) {
-            size_t copy_size = (size < msg.size) ? size : msg.size;
-            memcpy(data, msg.data, copy_size);
-            if (stats) {
-                *stats = msg.stats;
-            }
-            ret = copy_size;
-        } else {
-            LOG_ERR("No RX message available");
-            ret = -EIO;
-        }
+    if (!ctrl_data->is_initialized) {
+        LOG_ERR("Radio is not initialized");
+        return -ENODEV;
+    }
 
-    } while (0);
+    /*
+     * k_msgq_get is thread-safe, no mutex needed here.
+     * This allows receive() to block without holding the mutex,
+     * enabling concurrent TX/RX operations.
+     */
+    if (k_msgq_get(&ctrl_data->rx_msgq, &msg, K_MSEC(timeout)) == 0) {
+        size_t copy_size = (size < msg.size) ? size : msg.size;
+        memcpy(data, msg.data, copy_size);
+        if (stats != NULL) {
+            *stats = msg.stats;
+        }
+        ret = copy_size;
+    } else {
+        ret = -EAGAIN;
+    }
 
     return ret;
 }
@@ -649,19 +698,34 @@ static int radio_ctrl_impl_get_stats(const struct device *dev,
                                       struct radio_ctrl_stats *stats)
 {
     struct radio_ctrl_data *data = dev->data;
-    int ret = 0;
 
-    if (!stats) {
+    if (stats == NULL) {
         return -EINVAL;
     }
 
     k_mutex_lock(&data->mutex, K_FOREVER);
 
-    *stats = data->stats;
+    /* Copy non-IRQ stats (protected by mutex) */
+    stats->tx_attempts = data->stats.tx_attempts;
+    stats->tx_success = data->stats.tx_success;
+    stats->tx_timeout = data->stats.tx_timeout;
+    stats->rx_attempts = data->stats.rx_attempts;
+    stats->rx_success = data->stats.rx_success;
+    stats->rx_timeout = data->stats.rx_timeout;
 
     k_mutex_unlock(&data->mutex);
 
-    return ret;
+    /* Copy IRQ stats from atomic counters (thread-safe without mutex) */
+    stats->irq.rx_done = atomic_get(&data->irq_stats_atomic.rx_done);
+    stats->irq.tx_done = atomic_get(&data->irq_stats_atomic.tx_done);
+    stats->irq.timeout = atomic_get(&data->irq_stats_atomic.timeout);
+    stats->irq.hdr_error = atomic_get(&data->irq_stats_atomic.hdr_error);
+    stats->irq.crc_error = atomic_get(&data->irq_stats_atomic.crc_error);
+    stats->irq.cad_done = atomic_get(&data->irq_stats_atomic.cad_done);
+    stats->irq.cad_ok = atomic_get(&data->irq_stats_atomic.cad_ok);
+    stats->irq.none = atomic_get(&data->irq_stats_atomic.none);
+
+    return 0;
 }
 
 static const struct radio_ctrl_driver_api radio_ctrl_api = {
@@ -684,6 +748,10 @@ static const struct radio_ctrl_driver_api radio_ctrl_api = {
     .get_stats = radio_ctrl_impl_get_stats,
 };
 
+/*
+ * Process received packet data.
+ * NOTE: Caller must hold the mutex to protect SPI access.
+ */
 static void radio_ctrl_rx_work(struct radio_ctrl_data *data)
 {
     ral_status_t ral_status = RAL_STATUS_OK;
@@ -719,11 +787,20 @@ static void radio_ctrl_rx_work(struct radio_ctrl_data *data)
     } while (0);
 }
 
+/*
+ * IRQ work handler - processes radio interrupts in thread context.
+ * Acquires mutex to protect SPI bus access from concurrent API calls.
+ * Uses atomic operations for IRQ stats to avoid race conditions.
+ */
 static void radio_ctrl_irq_work(struct k_work *work)
 {
     struct radio_ctrl_data *data = CONTAINER_OF(work, struct radio_ctrl_data, irq_work);
     ral_status_t ral_status = RAL_STATUS_OK;
     ral_irq_t irq_status = RAL_IRQ_NONE;
+    uint32_t events_to_post = 0;
+
+    /* Acquire mutex to protect SPI bus access */
+    k_mutex_lock(&data->mutex, K_FOREVER);
 
     do {
         ral_status = ral_get_and_clear_irq_status(ral_from_ralf(&data->radio), &irq_status);
@@ -734,47 +811,55 @@ static void radio_ctrl_irq_work(struct k_work *work)
 
         if (irq_status & RAL_IRQ_TX_DONE) {
             LOG_DBG("TX Done IRQ");
-            data->stats.irq.tx_done++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_TX_DONE);
+            atomic_inc(&data->irq_stats_atomic.tx_done);
+            events_to_post |= RADIO_CTRL_EVENT_TX_DONE;
         }
         if (irq_status & RAL_IRQ_RX_DONE) {
             LOG_DBG("RX Done IRQ");
-            data->stats.irq.rx_done++;
+            atomic_inc(&data->irq_stats_atomic.rx_done);
             radio_ctrl_rx_work(data);
-            k_event_post(&data->event, RADIO_CTRL_EVENT_RX_DONE);
+            events_to_post |= RADIO_CTRL_EVENT_RX_DONE;
         }
         if (irq_status & RAL_IRQ_RX_TIMEOUT) {
             LOG_DBG("RX Timeout IRQ");
-            data->stats.irq.timeout++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_RX_TIMEOUT);
+            atomic_inc(&data->irq_stats_atomic.timeout);
+            events_to_post |= RADIO_CTRL_EVENT_RX_TIMEOUT;
         }
         if (irq_status & RAL_IRQ_RX_HDR_ERROR) {
             LOG_DBG("RX Header Error IRQ");
-            data->stats.irq.hdr_error++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_RX_HDR_ERROR);
+            atomic_inc(&data->irq_stats_atomic.hdr_error);
+            events_to_post |= RADIO_CTRL_EVENT_RX_HDR_ERROR;
         }
         if (irq_status & RAL_IRQ_RX_CRC_ERROR) {
             LOG_DBG("RX CRC Error IRQ");
-            data->stats.irq.crc_error++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_RX_CRC_ERROR);
+            atomic_inc(&data->irq_stats_atomic.crc_error);
+            events_to_post |= RADIO_CTRL_EVENT_RX_CRC_ERROR;
         }
         if (irq_status & RAL_IRQ_CAD_DONE) {
             LOG_DBG("CAD Done IRQ");
-            data->stats.irq.cad_done++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_CAD_DONE);
+            atomic_inc(&data->irq_stats_atomic.cad_done);
+            events_to_post |= RADIO_CTRL_EVENT_CAD_DONE;
         }
         if (irq_status & RAL_IRQ_CAD_OK) {
             LOG_DBG("CAD OK IRQ");
-            data->stats.irq.cad_ok++;
-            k_event_post(&data->event, RADIO_CTRL_EVENT_CAD_OK);
+            atomic_inc(&data->irq_stats_atomic.cad_ok);
+            events_to_post |= RADIO_CTRL_EVENT_CAD_OK;
         }
 
         if (irq_status == RAL_IRQ_NONE) {
             LOG_DBG("Spurious IRQ");
-            data->stats.irq.none++;
+            atomic_inc(&data->irq_stats_atomic.none);
         }
 
     } while (0);
+
+    /* Release mutex before posting events to avoid potential priority inversion */
+    k_mutex_unlock(&data->mutex);
+
+    /* Post events outside mutex to allow waiting threads to proceed */
+    if (events_to_post != 0) {
+        k_event_post(&data->event, events_to_post);
+    }
 }
 
 static void radio_ctrl_irq_isr(const struct device *port, struct gpio_callback *cb, uint32_t pins)

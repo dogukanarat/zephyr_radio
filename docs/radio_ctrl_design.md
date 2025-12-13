@@ -257,10 +257,39 @@ struct radio_ctrl_stats {
 
 ## Thread Safety
 
-- All public APIs acquire a mutex before accessing shared data
-- ISR handling is deferred to a work queue for thread-safe processing
-- Event signaling uses atomic kernel primitives
-- Message queue operations are inherently thread-safe
+The driver is designed to be thread-safe for concurrent access from multiple threads:
+
+### Synchronization Mechanisms
+
+| Resource | Protection | Notes |
+|----------|------------|-------|
+| SPI bus | Mutex | All SPI transactions protected by shared mutex |
+| Configuration params | Mutex | Get/set operations hold mutex |
+| TX/RX stats | Mutex | Protected for consistent reads |
+| IRQ stats | Atomic ops | Lock-free using `atomic_t` counters |
+| RX message queue | k_msgq | Inherently thread-safe |
+| Event flags | k_event | Kernel-provided thread safety |
+
+### Concurrent Operation Support
+
+- **TX + RX**: Supported. `receive()` doesn't hold mutex while waiting.
+- **Multiple TX**: Serialized via mutex - only one TX at a time.
+- **TX during IRQ**: Safe. TX releases mutex before waiting, allowing IRQ work to proceed.
+
+### Deadlock Prevention
+
+The transmit function uses a careful lock ordering to avoid deadlock:
+1. Acquire mutex for TX setup
+2. Release mutex before `k_event_wait()`
+3. IRQ work handler can now acquire mutex
+4. Re-acquire mutex for cleanup after event
+
+### IRQ Context Safety
+
+- GPIO ISR immediately defers to work queue (no SPI in ISR)
+- Work queue handler acquires mutex before SPI operations
+- Atomic operations used for IRQ statistics (no lock needed)
+- Events posted after mutex release to avoid priority inversion
 
 ## Limitations
 
