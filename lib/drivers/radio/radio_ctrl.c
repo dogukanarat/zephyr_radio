@@ -519,127 +519,139 @@ static int radio_ctrl_impl_transmit(const struct device *dev, const uint8_t *dat
     uint32_t tx_timeout;
     bool tx_started = false;
     ralf_params_lora_t lora_params = {0};
+    bool is_mutex_taken = false;
 
-    if (data == NULL) {
-        return -EINVAL;
-    }
-
-    if (size > CONFIG_RADIO_CTRL_MAX_MSG_SIZE) {
-        LOG_ERR("Data size exceeds maximum limit: %d > %d", size, CONFIG_RADIO_CTRL_MAX_MSG_SIZE);
-        return -EINVAL;
-    }
-
-    k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
-
-    ctrl_data->stats.tx_attempts++;
-
-    if (!ctrl_data->is_ralf_initialized) {
-        ret = -ENODEV;
-        LOG_ERR("Radio is not initialized");
-        goto unlock_and_return;
-    }
-
-    if (!ctrl_data->is_configured) {
-        ret = -EACCES;
-        LOG_ERR("Radio is not configured");
-        goto unlock_and_return;
-    }
-
-    /* Clear any stale TX_DONE events from previous operations */
-    k_event_clear(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE);
-
-    tx_timeout = ral_get_lora_time_on_air_in_ms(ral_from_ralf(&ctrl_data->radio),
-                                                &ctrl_data->tx_params.pkt_params,
-                                                &ctrl_data->tx_params.mod_params);
-    tx_timeout += 100; /* Add 100 ms for processing delay */
-
-    memcpy(&lora_params, &ctrl_data->tx_params, sizeof(ralf_params_lora_t));
-    lora_params.pkt_params.pld_len_in_bytes = size;
-
-    /* Set the radio to standby */
-    ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
-    if (RAL_STATUS_OK != ral_status) {
-        ret = -EIO;
-        LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
-        goto unlock_and_return;
-    }
-
-    /* Set the LoRa modem parameters */
-    ral_status = ralf_setup_lora(&ctrl_data->radio, &lora_params);
-    if (RAL_STATUS_OK != ral_status) {
-        ret = -EIO;
-        LOG_ERR("Failed to setup the LoRa modem! Status: %08X", ral_status);
-        goto unlock_and_return;
-    }
-
-    /* Set the DIO IRQ parameters */
-    ral_status = ral_set_dio_irq_params(ral_from_ralf(&ctrl_data->radio), RAL_IRQ_TX_DONE);
-    if (RAL_STATUS_OK != ral_status) {
-        ret = -EIO;
-        LOG_ERR("Failed to set the DIO IRQ parameters! Status: %08X", ral_status);
-        goto unlock_and_return;
-    }
-
-    /* Set the packet payload */
-    ral_status = ral_set_pkt_payload(ral_from_ralf(&ctrl_data->radio), data, size);
-    if (RAL_STATUS_OK != ral_status) {
-        ret = -EIO;
-        LOG_ERR("Failed to set the packet payload! Status: %08X", ral_status);
-        goto unlock_and_return;
-    }
-
-    /* Set the radio to transmit */
-    ral_status = ral_set_tx(ral_from_ralf(&ctrl_data->radio));
-    if (RAL_STATUS_OK != ral_status) {
-        ret = -EIO;
-        LOG_ERR("Failed to set the radio to transmit! Status: %08X", ral_status);
-        goto unlock_and_return;
-    }
-
-    tx_started = true;
-    LOG_DBG("Transmitting... data size: %d, timeout: %d ms", size, tx_timeout);
-
-    /*
-     * Release mutex before waiting for TX completion.
-     * This allows the IRQ work handler to acquire the mutex and process
-     * the TX_DONE interrupt. Without this, we would deadlock.
-     */
-    k_mutex_unlock(&ctrl_data->mutex);
-
-    /* Wait for TX completion event - mutex not held */
-    uint32_t events = k_event_wait(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE, true,
-                                   K_MSEC(tx_timeout));
-
-    /* Re-acquire mutex for cleanup and stats update */
-    k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
-
-    if ((events & RADIO_CTRL_EVENT_TX_DONE) == 0) {
-        ret = -ETIMEDOUT;
-        ctrl_data->stats.tx_timeout++;
-        LOG_ERR("Transmit timeout");
-    } else {
-        ret = 0;
-        ctrl_data->stats.tx_success++;
-        LOG_DBG("Transmit done!");
-    }
-
-    /* Return radio to standby after TX completes or times out */
-    ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
-    if (RAL_STATUS_OK != ral_status) {
-        LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
-        if (ret == 0) {
-            ret = -EIO;
+    for (;;)
+    {
+        if (data == NULL) {
+            ret = -EINVAL;
+            break;
         }
+
+        if (size > CONFIG_RADIO_CTRL_MAX_MSG_SIZE) {
+            LOG_ERR("Data size exceeds maximum limit: %d > %d", size, CONFIG_RADIO_CTRL_MAX_MSG_SIZE);
+            ret = -EINVAL;
+            break;
+        }
+
+        k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
+        is_mutex_taken = true;
+
+        ctrl_data->stats.tx_attempts++;
+
+        if (!ctrl_data->is_ralf_initialized) {
+            ret = -ENODEV;
+            LOG_ERR("Radio is not initialized");
+            break;
+        }
+
+        if (!ctrl_data->is_configured) {
+            ret = -EACCES;
+            LOG_ERR("Radio is not configured");
+            break;
+        }
+
+        /* Clear any stale TX_DONE events from previous operations */
+        k_event_clear(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE);
+
+        tx_timeout = ral_get_lora_time_on_air_in_ms(ral_from_ralf(&ctrl_data->radio),
+                                                    &ctrl_data->tx_params.pkt_params,
+                                                    &ctrl_data->tx_params.mod_params);
+        tx_timeout += 100; /* Add 100 ms for processing delay */
+
+        memcpy(&lora_params, &ctrl_data->tx_params, sizeof(ralf_params_lora_t));
+        lora_params.pkt_params.pld_len_in_bytes = size;
+
+        /* Set the radio to standby */
+        ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
+        if (RAL_STATUS_OK != ral_status) {
+            ret = -EIO;
+            LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
+            break;
+        }
+
+        /* Set the LoRa modem parameters */
+        ral_status = ralf_setup_lora(&ctrl_data->radio, &lora_params);
+        if (RAL_STATUS_OK != ral_status) {
+            ret = -EIO;
+            LOG_ERR("Failed to setup the LoRa modem! Status: %08X", ral_status);
+            break;
+        }
+
+        /* Set the DIO IRQ parameters */
+        ral_status = ral_set_dio_irq_params(ral_from_ralf(&ctrl_data->radio), RAL_IRQ_TX_DONE);
+        if (RAL_STATUS_OK != ral_status) {
+            ret = -EIO;
+            LOG_ERR("Failed to set the DIO IRQ parameters! Status: %08X", ral_status);
+            break;
+        }
+
+        /* Set the packet payload */
+        ral_status = ral_set_pkt_payload(ral_from_ralf(&ctrl_data->radio), data, size);
+        if (RAL_STATUS_OK != ral_status) {
+            ret = -EIO;
+            LOG_ERR("Failed to set the packet payload! Status: %08X", ral_status);
+            break;
+        }
+
+        /* Set the radio to transmit */
+        ral_status = ral_set_tx(ral_from_ralf(&ctrl_data->radio));
+        if (RAL_STATUS_OK != ral_status) {
+            ret = -EIO;
+            LOG_ERR("Failed to set the radio to transmit! Status: %08X", ral_status);
+            break;
+        }
+
+        tx_started = true;
+        LOG_DBG("Transmitting... data size: %d, timeout: %d ms", size, tx_timeout);
+
+        /*
+         * Release mutex before waiting for TX completion.
+         * This allows the IRQ work handler to acquire the mutex and process
+         * the TX_DONE interrupt. Without this, we would deadlock.
+         */
+        k_mutex_unlock(&ctrl_data->mutex);
+
+        /* Wait for TX completion event - mutex not held */
+        uint32_t events = k_event_wait(&ctrl_data->event, RADIO_CTRL_EVENT_TX_DONE, true,
+                                       K_MSEC(tx_timeout));
+
+        /* Re-acquire mutex for cleanup and stats update */
+        k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
+
+        if ((events & RADIO_CTRL_EVENT_TX_DONE) == 0) {
+            ret = -ETIMEDOUT;
+            ctrl_data->stats.tx_timeout++;
+            LOG_ERR("Transmit timeout");
+        } else {
+            ret = 0;
+            ctrl_data->stats.tx_success++;
+            LOG_DBG("Transmit done!");
+        }
+
+        /* Return radio to standby after TX completes or times out */
+        ral_status = ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
+        if (RAL_STATUS_OK != ral_status) {
+            LOG_ERR("Failed to set the radio to standby! Status: %08X", ral_status);
+            if (ret == 0) {
+                ret = -EIO;
+            }
+            break;
+        }
+
+        break;
     }
 
-unlock_and_return:
     /* Handle case where TX setup failed before starting */
     if (!tx_started && ret != 0) {
         /* Try to put radio in known state */
         ral_set_standby(ral_from_ralf(&ctrl_data->radio), RAL_STANDBY_CFG_RC);
     }
 
-    k_mutex_unlock(&ctrl_data->mutex);
+    if (is_mutex_taken) {
+        k_mutex_unlock(&ctrl_data->mutex);
+    }
+
     return ret;
 }
 
