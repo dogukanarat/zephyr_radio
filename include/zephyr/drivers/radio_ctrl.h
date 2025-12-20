@@ -11,6 +11,8 @@
 extern "C" {
 #endif
 
+#define RADIO_CTRL_RX_TIMEOUT_MAX_MS       262144
+
 enum radio_type {
     RADIO_TYPE_SX126X,
     RADIO_TYPE_SX127X,

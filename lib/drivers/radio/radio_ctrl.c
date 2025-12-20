@@ -20,9 +20,6 @@ LOG_MODULE_REGISTER(radio_ctrl, CONFIG_RADIO_CTRL_LOG_LEVEL);
 #define RADIO_CTRL_EVENT_CAD_DONE          BIT(5)
 #define RADIO_CTRL_EVENT_CAD_OK            BIT(6)
 
-/* Maximum RX timeout value supported by the SX126x driver (2^18 ms) */
-#define RADIO_CTRL_RX_TIMEOUT_MAX_MS       262144
-
 /* Maximum SPI transfer size for stack-allocated buffers */
 #define RADIO_CTRL_HAL_MAX_TRANSFER_SIZE   256
 
@@ -135,6 +132,17 @@ sx126x_hal_status_t sx126x_hal_read(const void *context, const uint8_t *command,
         command_length > RADIO_CTRL_HAL_MAX_TRANSFER_SIZE) {
         LOG_ERR("HAL transfer size exceeds maximum: cmd=%u, data=%u, max=%u",
                 command_length, data_length, RADIO_CTRL_HAL_MAX_TRANSFER_SIZE);
+        return SX126X_HAL_STATUS_ERROR;
+    }
+
+    do {
+        busy_state = gpio_pin_get_dt(busy);
+        if (busy_state == 0) {
+            break;
+        }
+        k_msleep(1);
+    } while ((k_uptime_get_32() - busy_start) < ctx->timeout);
+    if ((k_uptime_get_32() - busy_start) >= ctx->timeout) {
         return SX126X_HAL_STATUS_ERROR;
     }
 
@@ -253,17 +261,10 @@ static int radio_ctrl_impl_set_config_gfsk(const struct device *dev,
                                            const ralf_params_gfsk_t *rx_params,
                                            const ralf_params_gfsk_t *tx_params)
 {
-    struct radio_ctrl_data *data = dev->data;
-
     if ((rx_params == NULL) || (tx_params == NULL)) {
         return -EINVAL;
     }
-
-    k_mutex_lock(&data->mutex, K_FOREVER);
-    /* TODO: implement GFSK config storage in data structure */
-    k_mutex_unlock(&data->mutex);
-
-    return 0;
+    return -ENOTSUP;
 }
 
 static int radio_ctrl_impl_set_config_lora(const struct device *dev,
@@ -291,34 +292,20 @@ static int radio_ctrl_impl_set_config_flrc(const struct device *dev,
                                            const ralf_params_flrc_t *rx_params,
                                            const ralf_params_flrc_t *tx_params)
 {
-    struct radio_ctrl_data *data = dev->data;
-
     if ((rx_params == NULL) || (tx_params == NULL)) {
         return -EINVAL;
     }
-
-    k_mutex_lock(&data->mutex, K_FOREVER);
-    /* TODO: implement FLRC config storage in data structure */
-    k_mutex_unlock(&data->mutex);
-
-    return 0;
+    return -ENOTSUP;
 }
 
 static int radio_ctrl_impl_set_config_lr_fhss(const struct device *dev,
                                               const ralf_params_lr_fhss_t *rx_params,
                                               const ralf_params_lr_fhss_t *tx_params)
 {
-    struct radio_ctrl_data *data = dev->data;
-
     if ((rx_params == NULL) || (tx_params == NULL)) {
         return -EINVAL;
     }
-
-    k_mutex_lock(&data->mutex, K_FOREVER);
-    /* TODO: implement LR-FHSS config storage in data structure */
-    k_mutex_unlock(&data->mutex);
-
-    return 0;
+    return -ENOTSUP;
 }
 
 static int radio_ctrl_impl_set_antenna_switch(const struct device *dev, bool tx_enable)
@@ -434,6 +421,7 @@ static int radio_ctrl_impl_listen(const struct device *dev, uint32_t timeout)
     ralf_params_lora_t lora_params = {0};
 
     k_mutex_lock(&ctrl_data->mutex, K_FOREVER);
+    ctrl_data->stats.rx_attempts++;
 
     do {
         if (!ctrl_data->is_ralf_initialized) {
@@ -671,6 +659,8 @@ static int radio_ctrl_impl_receive(const struct device *dev, uint8_t *data, size
         return -ENODEV;
     }
 
+    ctrl_data->stats.rx_attempts++;
+
     /*
      * k_msgq_get is thread-safe, no mutex needed here.
      * This allows receive() to block without holding the mutex,
@@ -683,8 +673,10 @@ static int radio_ctrl_impl_receive(const struct device *dev, uint8_t *data, size
             *stats = msg.stats;
         }
         ret = copy_size;
+        ctrl_data->stats.rx_success++;
     } else {
         ret = -EAGAIN;
+        ctrl_data->stats.rx_timeout++;
     }
 
     return ret;
@@ -793,7 +785,7 @@ static void radio_ctrl_rx_work(struct radio_ctrl_data *data)
             break;
         }
 
-        LOG_INF("Received packet (%d/%d): size=%d, rssi=%d dBm, snr=%d dB",
+        LOG_DBG("Received packet (%d/%d): size=%d, rssi=%d dBm, snr=%d dB",
                 k_msgq_num_used_get(&data->rx_msgq), CONFIG_RADIO_CTRL_RX_MSGQ_MAX_MSGS, msg.size,
                 msg.stats.rssi, msg.stats.snr);
     } while (0);
@@ -974,7 +966,7 @@ static int radio_ctrl_init(const struct device *dev)
         return -EIO;
     }
 
-    LOG_INF("SX1262 radio initialized");
+    LOG_DBG("SX1262 radio initialized");
 
     data->is_initialized = true;
 
