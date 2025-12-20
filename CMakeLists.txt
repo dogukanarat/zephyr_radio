@@ -33,7 +33,4 @@ if(CONFIG_RADIO_CTRL)
   zephyr_include_directories(
       include
   )
-
-  # Disable unused warnings
-  zephyr_compile_options(-Wno-unused-parameter -Wno-unused-variable -Wno-unused-function)
 endif()
