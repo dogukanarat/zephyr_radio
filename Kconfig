@@ -12,9 +12,14 @@ if RADIO_CTRL
         Enable driver for SX1262-based radio using your custom API.
     config RADIO_CTRL_LOG_LEVEL
         int "Radio controller driver log level"
-        default 3
+        default 2
         help
-        Set the log level for the radio controller driver (0-4).
+            Set the log level for the DANP module:
+            0: Off
+            1: Error
+            2: Warning
+            3: Info
+            4: Debug
     config RADIO_CTRL_INIT_PRIORITY
         int "Radio controller driver init priority"
         default 90
